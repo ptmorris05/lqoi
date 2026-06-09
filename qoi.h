@@ -316,7 +316,19 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                         signed char dr_dg = vr - decoded_dg;
                         signed char db_dg = vb - decoded_dg;
 
-                        if (dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7) {
+                        /* The green LSB dropped by the bitshift normally costs at
+                           most 1 level. But when the true green sits at the very
+                           edge of the channel, that 1-level reconstruction wraps
+                           the unsigned byte (e.g. 0 -> 255), turning a tiny error
+                           into a catastrophic one. Reject LUMA in that case and
+                           fall through to an exact QOI_OP_RGB. The decoder is
+                           unchanged; r and b are exact mod 256 regardless. */
+                        int recon_g = (unsigned char)(px_prev.rgba.g + decoded_dg);
+                        int green_err = recon_g - (int)px.rgba.g;
+                        if (green_err < 0) green_err = -green_err;
+
+                        if (dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 &&
+                            green_err <= 1) {
                             bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
                             bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
 

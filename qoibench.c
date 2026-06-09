@@ -27,7 +27,15 @@ Compile with:
 #define QOI_IMPLEMENTATION
 #include "qoi.h"
 
+#include <math.h>
 
+// LQOI is lossy, so the roundtrip cannot be verified with an exact memcmp.
+// Instead we assert the codec's own perceptual contract: alpha must be exact
+// and the per-pixel green-weighted Manhattan error 2*|dG|+|dR|+|dB| must stay
+// within this budget (must match qoi.h). A decoder/encoder desync would blow
+// far past it, so this is still a real correctness gate. See lqoibench.c for
+// the full quantitative + qualitative lossy assessment.
+#define LQOI_PERC_THRESHOLD 6
 
 
 // -----------------------------------------------------------------------------
@@ -405,14 +413,34 @@ benchmark_result_t benchmark_image(const char *path) {
 		ERROR("Error encoding %s", path);
 	}
 
-	// Verify QOI Output
+	// Verify QOI Output (lossy-aware: bounded perceptual error, not exact match)
 
 	if (!opt_noverify) {
 		qoi_desc dc;
-		void *pixels_qoi = qoi_decode(encoded_qoi, encoded_qoi_size, &dc, channels);
-		if (memcmp(pixels, pixels_qoi, w * h * channels) != 0) {
-			ERROR("QOI roundtrip pixel mismatch for %s", path);
+		unsigned char *pixels_qoi = qoi_decode(encoded_qoi, encoded_qoi_size, &dc, channels);
+		const unsigned char *src = pixels;
+		int max_gwm = 0;
+		double sq = 0;
+		long npx = (long)w * h;
+		for (long i = 0; i < npx; i++) {
+			const unsigned char *o = src + i * channels;
+			const unsigned char *d = pixels_qoi + i * channels;
+			int dr = (int)d[0]-o[0], dg = (int)d[1]-o[1], db = (int)d[2]-o[2];
+			int gwm = 2*abs(dg) + abs(dr) + abs(db);
+			if (gwm > max_gwm) max_gwm = gwm;
+			sq += (double)dr*dr + (double)dg*dg + (double)db*db;
+			if (channels == 4 && d[3] != o[3]) {
+				ERROR("QOI alpha not reconstructed exactly for %s (pixel %ld)", path, i);
+			}
 		}
+		if (max_gwm > LQOI_PERC_THRESHOLD) {
+			ERROR("QOI roundtrip exceeds perceptual budget for %s "
+				"(green-weighted Manhattan %d > %d)", path, max_gwm, LQOI_PERC_THRESHOLD);
+		}
+		double mse = sq / (npx * 3.0);
+		double psnr = mse > 0 ? 10.0 * log10((255.0*255.0)/mse) : 99.99;
+		printf("## %s  verify ok: PSNR %.2f dB, max perceptual err %d/%d\n",
+			path, psnr, max_gwm, LQOI_PERC_THRESHOLD);
 		free(pixels_qoi);
 	}
 
