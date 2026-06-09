@@ -14,7 +14,7 @@ The original QOI format is strictly lossless, which limits its compression capab
 
 **LQOI makes QOI lossy.** By applying targeted, human-vision-biased quantization during encoding, LQOI massively increases the hit-rate of QOI's most efficient opcodes (`QOI_OP_RUN` and `QOI_OP_INDEX`).
 
-The primary design constraint of LQOI is performance: the modifications require **no branching** and **no dynamic state synchronization** in the decoder. All perceptual checks are confined to the encode pass. As a result **decode is actually ~8% faster** than lossless QOI (the smaller stream has fewer chunks to process), while **encode costs ~14%** for the added per-pixel perceptual checks — a one-time cost paid when writing, in exchange for significantly smaller files (see benchmarks below).
+The primary design constraint of LQOI is performance: the modifications require **no branching** and **no dynamic state synchronization** in the decoder. All perceptual checks are confined to the encode pass, and the encoder uses channel-specialized hot loops to keep them cheap. As a result **decode is actually ~7% faster** than lossless QOI (the smaller stream has fewer chunks to process), while **encode stays within ~7%** of lossless QOI despite the added per-pixel perceptual checks — a small one-time cost paid when writing, in exchange for significantly smaller files (see benchmarks below).
 
 ### Benchmark Results
 
@@ -22,10 +22,10 @@ Measured on the [Kodak True Color suite](http://r0k.us/graphics/kodak/) (24 phot
 
 | Codec | Compression | Size vs raw | Fidelity (PSNR) | Decode | Encode |
 |-------|-------------|-------------|-----------------|--------|--------|
-| QOI (lossless) | 1.72× | 58.3% | ∞ (lossless) | 302 Mpx/s | 220 Mpx/s |
-| **LQOI (lossy)** | **1.94×** | **51.6%** | **48.86 dB** | **325 Mpx/s (+8%)** | **189 Mpx/s (−14%)** |
+| QOI (lossless) | 1.72× | 58.3% | ∞ (lossless) | 305 Mpx/s | 220 Mpx/s |
+| **LQOI (lossy)** | **1.94×** | **51.6%** | **48.86 dB** | **326 Mpx/s (+7%)** | **203 Mpx/s (−7%)** |
 
-LQOI produces files **11.4% smaller than lossless QOI** (1.13×) while reconstructing every pixel within its perceptual budget (green-weighted error ≤ 6, alpha exact) — ~49 dB PSNR is visually near-lossless. **Decode is ~8% faster** than lossless QOI (fewer chunks to process); **encode is ~14% slower**, the cost of the per-pixel perceptual checks.
+LQOI produces files **11.4% smaller than lossless QOI** (1.13×) while reconstructing every pixel within its perceptual budget (green-weighted error ≤ 6, alpha exact) — ~49 dB PSNR is visually near-lossless. **Decode is ~7% faster** than lossless QOI (fewer chunks to process); **encode is only ~7% slower** despite the per-pixel perceptual checks, thanks to channel-specialized encode loops.
 
 See [`BENCHMARKING.md`](BENCHMARKING.md) to reproduce (`./run_benchmark.sh`).
 

@@ -75,10 +75,11 @@ artifacts, datasets, results) is gitignored under `vendor/`, `images/` and
 ## Latest results (Kodak, 24 images)
 
 Overall PSNR **48.86 dB**, LQOI **88.6%** of strictly-lossless QOI size. Speed
-vs lossless QOI: **decode ~+8%** (325 vs 302 Mpx/s), **encode ~−14%** (189 vs
-220 Mpx/s) — the perceptual checks cost encode time, while the smaller stream
-decodes faster. Max perceptual error **6/6** with **0** pixels exceeding the
-budget and alpha exact — the encode→decode loop is verified correct. See
+vs lossless QOI: **decode ~+7%** (326 vs 305 Mpx/s), **encode ~−7%** (203 vs
+220 Mpx/s) — the smaller stream decodes faster, and channel-specialized encode
+loops keep the per-pixel perceptual checks cheap enough to stay within ~7% on
+encode. Max perceptual error **6/6** with **0** pixels exceeding the budget and
+alpha exact — the encode→decode loop is verified correct. See
 `results/RESULTS.md` for the full table.
 
 > Note: the comprehensive benchmark's correctness gate caught a real

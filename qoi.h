@@ -253,76 +253,177 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
     px_end = px_len - desc->channels;
     channels = desc->channels;
 
-    for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-        px.rgba.r = pixels[px_pos + 0];
-        px.rgba.g = pixels[px_pos + 1];
-        px.rgba.b = pixels[px_pos + 2];
-
-        if (channels == 4) {
+    /* The per-pixel hot path is split into two channel-specialized loops. For
+       RGB input the alpha never varies, so the RGB loop drops the per-pixel
+       alpha load and the three alpha comparisons (run / index / diff gates),
+       which measurably speeds up encoding. The two loops are otherwise
+       identical in behaviour and emit a bitstream-identical stream -- keep them
+       in sync if the encoding logic changes. The hash of px is reused for the
+       palette store (only the LUMA branch mutates px and needs a fresh hash). */
+    if (channels == 4) {
+        for (px_pos = 0; px_pos < px_len; px_pos += 4) {
+            px.rgba.r = pixels[px_pos + 0];
+            px.rgba.g = pixels[px_pos + 1];
+            px.rgba.b = pixels[px_pos + 2];
             px.rgba.a = pixels[px_pos + 3];
-        }
 
-        /* 1 & 2. Chroma-Biased Lossy Runs using Green-Weighted Manhattan Distance */
-        int err_run = 2 * abs((int)px.rgba.g - (int)px_prev.rgba.g) +
-                          abs((int)px.rgba.r - (int)px_prev.rgba.r) +
-                          abs((int)px.rgba.b - (int)px_prev.rgba.b);
+            /* 1 & 2. Chroma-Biased Lossy Runs using Green-Weighted Manhattan Distance */
+            int err_run = 2 * abs((int)px.rgba.g - (int)px_prev.rgba.g) +
+                              abs((int)px.rgba.r - (int)px_prev.rgba.r) +
+                              abs((int)px.rgba.b - (int)px_prev.rgba.b);
 
-        if (px.rgba.a == px_prev.rgba.a && err_run <= 6) {
-            run++;
-            if (run == 62 || px_pos == px_end) {
+            if (px.rgba.a == px_prev.rgba.a && err_run <= 6) {
+                run++;
+                if (run == 62 || px_pos == px_end) {
+                    bytes[p++] = QOI_OP_RUN | (run - 1);
+                    run = 0;
+                }
+                continue; /* px_prev remains the base pixel */
+            }
+
+            if (run > 0) {
                 bytes[p++] = QOI_OP_RUN | (run - 1);
                 run = 0;
             }
-            continue; /* px_prev remains unmodified, acting as the base pixel */
+
+            int index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+            qoi_rgba_t pal_px = index[index_pos];
+
+            /* 3. Lossy Indexing (Snap to Palette) */
+            int err_idx = 2 * abs((int)px.rgba.g - (int)pal_px.rgba.g) +
+                              abs((int)px.rgba.r - (int)pal_px.rgba.r) +
+                              abs((int)px.rgba.b - (int)pal_px.rgba.b);
+
+            if (px.rgba.a == pal_px.rgba.a && err_idx <= 6) {
+                bytes[p++] = QOI_OP_INDEX | index_pos;
+                px = pal_px; /* 4. Base Pixel Hash Injection */
+            }
+            else {
+                int store_pos = index_pos;
+
+                if (px.rgba.a == px_prev.rgba.a) {
+                    signed char vr = px.rgba.r - px_prev.rgba.r;
+                    signed char vg = px.rgba.g - px_prev.rgba.g;
+                    signed char vb = px.rgba.b - px_prev.rgba.b;
+
+                    /* Standard Diff Ranges [-2, 1] (Restored to prevent zero-hole tinting) */
+                    if (vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2) {
+                        bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+                    }
+                    else {
+                        /* Scaled Luma (Doubled range via bitshift) */
+                        int encoded_dg = ((int)vg) >> 1;
+
+                        if (encoded_dg >= -32 && encoded_dg <= 31) {
+                            int decoded_dg = encoded_dg << 1;
+                            signed char dr_dg = vr - decoded_dg;
+                            signed char db_dg = vb - decoded_dg;
+
+                            /* Reject LUMA if the dropped green LSB would wrap the
+                               unsigned byte (0 -> 255); fall through to exact RGB. */
+                            int recon_g = (unsigned char)(px_prev.rgba.g + decoded_dg);
+                            int green_err = recon_g - (int)px.rgba.g;
+                            if (green_err < 0) green_err = -green_err;
+
+                            if (dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 &&
+                                green_err <= 1) {
+                                bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
+                                bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
+
+                                px.rgba.r = px_prev.rgba.r + decoded_dg + dr_dg;
+                                px.rgba.g = px_prev.rgba.g + decoded_dg;
+                                px.rgba.b = px_prev.rgba.b + decoded_dg + db_dg;
+                                store_pos = QOI_COLOR_HASH(px) & (64 - 1);
+                            }
+                            else {
+                                bytes[p++] = QOI_OP_RGB;
+                                bytes[p++] = px.rgba.r;
+                                bytes[p++] = px.rgba.g;
+                                bytes[p++] = px.rgba.b;
+                            }
+                        }
+                        else {
+                            bytes[p++] = QOI_OP_RGB;
+                            bytes[p++] = px.rgba.r;
+                            bytes[p++] = px.rgba.g;
+                            bytes[p++] = px.rgba.b;
+                        }
+                    }
+                }
+                else {
+                    bytes[p++] = QOI_OP_RGBA;
+                    bytes[p++] = px.rgba.r;
+                    bytes[p++] = px.rgba.g;
+                    bytes[p++] = px.rgba.b;
+                    bytes[p++] = px.rgba.a;
+                }
+
+                index[store_pos] = px;
+            }
+
+            px_prev = px;
         }
+    }
+    else {
+        for (px_pos = 0; px_pos < px_len; px_pos += 3) {
+            px.rgba.r = pixels[px_pos + 0];
+            px.rgba.g = pixels[px_pos + 1];
+            px.rgba.b = pixels[px_pos + 2];
 
-        if (run > 0) {
-            bytes[p++] = QOI_OP_RUN | (run - 1);
-            run = 0;
-        }
+            /* 1 & 2. Chroma-Biased Lossy Runs (alpha is constant for RGB) */
+            int err_run = 2 * abs((int)px.rgba.g - (int)px_prev.rgba.g) +
+                              abs((int)px.rgba.r - (int)px_prev.rgba.r) +
+                              abs((int)px.rgba.b - (int)px_prev.rgba.b);
 
-        int index_pos = QOI_COLOR_HASH(px) & (64 - 1);
-        qoi_rgba_t pal_px = index[index_pos];
+            if (err_run <= 6) {
+                run++;
+                if (run == 62 || px_pos == px_end) {
+                    bytes[p++] = QOI_OP_RUN | (run - 1);
+                    run = 0;
+                }
+                continue; /* px_prev remains the base pixel */
+            }
 
-        /* 3. Lossy Indexing (Snap to Palette) */
-        int err_idx = 2 * abs((int)px.rgba.g - (int)pal_px.rgba.g) +
-                          abs((int)px.rgba.r - (int)pal_px.rgba.r) +
-                          abs((int)px.rgba.b - (int)pal_px.rgba.b);
+            if (run > 0) {
+                bytes[p++] = QOI_OP_RUN | (run - 1);
+                run = 0;
+            }
 
-        if (px.rgba.a == pal_px.rgba.a && err_idx <= 6) {
-            bytes[p++] = QOI_OP_INDEX | index_pos;
-            px = pal_px; /* 4. Base Pixel Hash Injection */
-        }
-        else {
-            if (px.rgba.a == px_prev.rgba.a) {
+            int index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+            qoi_rgba_t pal_px = index[index_pos];
+
+            /* 3. Lossy Indexing (Snap to Palette) */
+            int err_idx = 2 * abs((int)px.rgba.g - (int)pal_px.rgba.g) +
+                              abs((int)px.rgba.r - (int)pal_px.rgba.r) +
+                              abs((int)px.rgba.b - (int)pal_px.rgba.b);
+
+            if (err_idx <= 6) {
+                bytes[p++] = QOI_OP_INDEX | index_pos;
+                px = pal_px; /* 4. Base Pixel Hash Injection */
+            }
+            else {
+                int store_pos = index_pos;
+
                 signed char vr = px.rgba.r - px_prev.rgba.r;
                 signed char vg = px.rgba.g - px_prev.rgba.g;
                 signed char vb = px.rgba.b - px_prev.rgba.b;
 
                 /* Standard Diff Ranges [-2, 1] (Restored to prevent zero-hole tinting) */
-                if (
-                    vr > -3 && vr < 2 &&
-                    vg > -3 && vg < 2 &&
-                    vb > -3 && vb < 2
-                ) {
+                if (vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2) {
                     bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
                 }
                 else {
                     /* Scaled Luma (Doubled range via bitshift) */
-                    int encoded_dg = ((int)vg) >> 1; 
+                    int encoded_dg = ((int)vg) >> 1;
 
                     if (encoded_dg >= -32 && encoded_dg <= 31) {
                         int decoded_dg = encoded_dg << 1;
                         signed char dr_dg = vr - decoded_dg;
                         signed char db_dg = vb - decoded_dg;
 
-                        /* The green LSB dropped by the bitshift normally costs at
-                           most 1 level. But when the true green sits at the very
-                           edge of the channel, that 1-level reconstruction wraps
-                           the unsigned byte (e.g. 0 -> 255), turning a tiny error
-                           into a catastrophic one. Reject LUMA in that case and
-                           fall through to an exact QOI_OP_RGB. The decoder is
-                           unchanged; r and b are exact mod 256 regardless. */
+                        /* Reject LUMA if the dropped green LSB would wrap the
+                           unsigned byte (0 -> 255); fall through to exact RGB.
+                           r and b are exact mod 256 regardless; decoder unchanged. */
                         int recon_g = (unsigned char)(px_prev.rgba.g + decoded_dg);
                         int green_err = recon_g - (int)px.rgba.g;
                         if (green_err < 0) green_err = -green_err;
@@ -332,10 +433,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                             bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
                             bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
 
-                            /* Quantize px locally to match decoded state */
                             px.rgba.r = px_prev.rgba.r + decoded_dg + dr_dg;
                             px.rgba.g = px_prev.rgba.g + decoded_dg;
                             px.rgba.b = px_prev.rgba.b + decoded_dg + db_dg;
+                            store_pos = QOI_COLOR_HASH(px) & (64 - 1);
                         }
                         else {
                             bytes[p++] = QOI_OP_RGB;
@@ -351,20 +452,12 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                         bytes[p++] = px.rgba.b;
                     }
                 }
-            }
-            else {
-                bytes[p++] = QOI_OP_RGBA;
-                bytes[p++] = px.rgba.r;
-                bytes[p++] = px.rgba.g;
-                bytes[p++] = px.rgba.b;
-                bytes[p++] = px.rgba.a;
+
+                index[store_pos] = px;
             }
 
-            /* Update palette using the dynamically substituted pixel */
-            index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
+            px_prev = px;
         }
-
-        px_prev = px;
     }
 
     for (i = 0; i < (int)sizeof(qoi_padding); i++) {
