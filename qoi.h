@@ -43,6 +43,75 @@ qoi_write("image_new.qoi", rgba_pixels, &(qoi_desc){
 qoi_desc desc;
 void *rgba_pixels = qoi_read("image.qoi", &desc, 4);
 
+-- Data Format
+
+A QOI file has a 14 byte header, followed by any number of data "chunks" and an
+8-byte end marker.
+
+struct qoi_header_t {
+    char     magic[4];   // magic bytes "qoif"
+    uint32_t width;      // image width in pixels (BE)
+    uint32_t height;     // image height in pixels (BE)
+    uint8_t  channels;   // 3 = RGB, 4 = RGBA
+    uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all channels linear
+};
+
+Pixels are encoded as
+ - a run of pixels perceptually similar to the previous pixel
+ - an index into an array of perceptually similar previously seen pixels
+ - a quantized difference to the previous pixel value in r,g,b
+ - full r,g,b or r,g,b,a values
+
+.- QOI_OP_INDEX ----------.
+|         Byte[0]         |
+|  7  6  5  4  3  2  1  0 |
+|-------+-----------------|
+|  0  0 |     index       |
+`-------------------------`
+2-bit tag b00
+6-bit index into the color index array: 0..63
+
+.- QOI_OP_DIFF -----------.
+|         Byte[0]         |
+|  7  6  5  4  3  2  1  0 |
+|-------+-----+-----+-----|
+|  0  1 |  dr |  dg |  db |
+`-------------------------`
+2-bit tag b01
+2-bit   red channel difference from the previous pixel mapped to {-4, -3, 2, 3}
+2-bit green channel difference from the previous pixel mapped to {-4, -3, 2, 3}
+2-bit  blue channel difference from the previous pixel mapped to {-4, -3, 2, 3}
+
+Values are mapped as follows: 
+b00 = -4, b01 = -3, b10 = 2, b11 = 3.
+
+.- QOI_OP_LUMA -------------------------------------.
+|         Byte[0]         |         Byte[1]         |
+|  7  6  5  4  3  2  1  0 |  7  6  5  4  3  2  1  0 |
+|-------+-----------------+-------------+-----------|
+|  1  0 |  green diff     |   dr - dg   |  db - dg  |
+`---------------------------------------------------`
+2-bit tag b10
+6-bit green channel difference from the previous pixel (bit-shifted) -32..31
+4-bit   red channel difference minus green channel difference -8..7
+4-bit  blue channel difference minus green channel difference -8..7
+
+The green channel difference is bit-shifted (divided by 2) during encoding, 
+doubling its effective range to -64..63. It is stored with a bias of 32.
+dr_dg and db_dg are calculated relative to the DECODED green difference.
+
+.- QOI_OP_RUN ------------.
+|         Byte[0]         |
+|  7  6  5  4  3  2  1  0 |
+|-------+-----------------|
+|  1  1 |       run       |
+`-------------------------`
+2-bit tag b11
+6-bit run-length repeating the previous pixel (or perceptually similar): 1..62
+
+.- QOI_OP_RGB / RGBA ------.
+(Identical to standard QOI format: b11111110 / b11111111 followed by raw bytes)
+
 */
 
 /* -----------------------------------------------------------------------------
