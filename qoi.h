@@ -17,8 +17,8 @@ Modifications in this variant:
 2. Chroma-Biased Lossy Runs: Micro-gradients are squashed into runs.
 3. Lossy Indexing: Pixels snap to perceptually similar palette colors using a locality-sensitive hash (bottom 3 bits masked).
 4. Base Pixel Hash Injection: State tracking uses substituted/quantized values.
-5. Repurposed Diff Ranges: QOI_OP_DIFF encodes {-4, -3, 2, 3}.
-6. Scaled QOI_OP_LUMA: Delta Green is bit-shifted, doubling the range to [-64, 63].
+5. Scaled QOI_OP_LUMA: Delta Green is bit-shifted, doubling the range to [-64, 63].
+(Note: QOI_OP_DIFF remains the standard exact [-2, 1] range to accurately encode flat color channels without introducing artificial color tints).
 
 -- Synopsis
 
@@ -78,12 +78,15 @@ Pixels are encoded as
 |  0  1 |  dr |  dg |  db |
 `-------------------------`
 2-bit tag b01
-2-bit   red channel difference from the previous pixel mapped to {-4, -3, 2, 3}
-2-bit green channel difference from the previous pixel mapped to {-4, -3, 2, 3}
-2-bit  blue channel difference from the previous pixel mapped to {-4, -3, 2, 3}
+2-bit   red channel difference from the previous pixel between -2..1
+2-bit green channel difference from the previous pixel between -2..1
+2-bit  blue channel difference from the previous pixel between -2..1
 
-Values are mapped as follows: 
-b00 = -4, b01 = -3, b10 = 2, b11 = 3.
+The difference to the current channel values are using a wraparound operation,
+so "1 - 2" will result in 255, while "255 + 1" will result in 0.
+
+Values are stored as unsigned integers with a bias of 2. E.g. -2 is stored as
+0 (b00). 1 is stored as 3 (b11).
 
 .- QOI_OP_LUMA -------------------------------------.
 |         Byte[0]         |         Byte[1]         |
@@ -296,28 +299,16 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                 signed char vg = px.rgba.g - px_prev.rgba.g;
                 signed char vb = px.rgba.b - px_prev.rgba.b;
 
-                /* 5. Repurposed Diff Ranges {-4, -3, 2, 3} */
-                if (vr >= -4 && vr <= 3 && vg >= -4 && vg <= 3 && vb >= -4 && vb <= 3) {
-                    
-                    /* Snap values perfectly to {-4, -3, 2, 3} */
-                    signed char svr = (vr < -2) ? vr : ((vr < 0) ? -3 : ((vr < 2) ? 2 : vr));
-                    signed char svg = (vg < -2) ? vg : ((vg < 0) ? -3 : ((vg < 2) ? 2 : vg));
-                    signed char svb = (vb < -2) ? vb : ((vb < 0) ? -3 : ((vb < 2) ? 2 : vb));
-
-                    /* Map {-4, -3, 2, 3} to 2-bit unsigned {0, 1, 2, 3} */
-                    int evr = (svr < 0) ? (svr + 4) : svr;
-                    int evg = (svg < 0) ? (svg + 4) : svg;
-                    int evb = (svb < 0) ? (svb + 4) : svb;
-
-                    bytes[p++] = QOI_OP_DIFF | (evr << 4) | (evg << 2) | evb;
-
-                    /* Apply quantization locally to ensure Base Pixel Hash Injection */
-                    px.rgba.r = px_prev.rgba.r + svr;
-                    px.rgba.g = px_prev.rgba.g + svg;
-                    px.rgba.b = px_prev.rgba.b + svb;
+                /* Standard Diff Ranges [-2, 1] (Restored to prevent zero-hole tinting) */
+                if (
+                    vr > -3 && vr < 2 &&
+                    vg > -3 && vg < 2 &&
+                    vb > -3 && vb < 2
+                ) {
+                    bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
                 }
                 else {
-                    /* 6. Scaled Luma (Doubled range via bitshift) */
+                    /* Scaled Luma (Doubled range via bitshift) */
                     int encoded_dg = ((int)vg) >> 1; 
 
                     if (encoded_dg >= -32 && encoded_dg <= 31) {
@@ -329,7 +320,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                             bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
                             bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
 
-                            /* Quantize px locally */
+                            /* Quantize px locally to match decoded state */
                             px.rgba.r = px_prev.rgba.r + decoded_dg + dr_dg;
                             px.rgba.g = px_prev.rgba.g + decoded_dg;
                             px.rgba.b = px_prev.rgba.b + decoded_dg + db_dg;
@@ -446,14 +437,9 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
                 px = index[b1];
             }
             else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-                /* Decode Repurposed Diff Ranges */
-                int dr = (b1 >> 4) & 0x03;
-                int dg = (b1 >> 2) & 0x03;
-                int db =  b1       & 0x03;
-                
-                px.rgba.r += (dr < 2) ? (dr - 4) : dr;
-                px.rgba.g += (dg < 2) ? (dg - 4) : dg;
-                px.rgba.b += (db < 2) ? (db - 4) : db;
+                px.rgba.r += ((b1 >> 4) & 0x03) - 2;
+                px.rgba.g += ((b1 >> 2) & 0x03) - 2;
+                px.rgba.b += ( b1       & 0x03) - 2;
             }
             else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
                 /* Decode Scaled Luma Ranges */
