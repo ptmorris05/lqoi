@@ -20,7 +20,7 @@ The primary design constraint of LQOI is performance: the modifications require 
 
 1. **Green-Weighted Manhattan Distance:** Replaces exact-match checks with a branchless L1 norm error threshold ($2|\Delta G| + |\Delta R| + |\Delta B| \le 6$). Alpha must remain exact.
 2. **Chroma-Biased Lossy Runs:** Micro-gradients are squashed into `QOI_OP_RUN` chunks. The run continues as long as the current pixel remains within the perceptual threshold of the *first* pixel in the run, preventing compounding drift.
-3. **Lossy Indexing (Snap to Palette):** Pixels evaluate the standard QOI hash. If the stored pixel is perceptually close (within the threshold), the pixel "snaps" to the palette color via `QOI_OP_INDEX`.
+3. **Lossy Indexing (Snap to Palette):** Pixels evaluate a locality-sensitive version of the standard QOI hash. If the stored pixel is perceptually close (within the threshold), the pixel "snaps" to the palette color via `QOI_OP_INDEX`.
 4. **Base Pixel Hash Injection:** When a pixel is quantized, the encoder injects the *substituted* value into the hash array, standardizing the palette and eliminating decoder mismatch.
 5. **Repurposed Diff Ranges:** Because tiny differences `[-1, 1]` are absorbed by Lossy Runs, `QOI_OP_DIFF` now encodes disconnected, medium-sized jumps: `{-4, -3, 2, 3}`.
 6. **Scaled `QOI_OP_LUMA`:** The Green channel payload is bit-shifted (`val >> 1`), doubling its effective reach to `[-64, 63]` and allowing medium-contrast edges to be captured in 2 bytes instead of 4.
