@@ -15,7 +15,7 @@ with minimal performance overhead. It stays strictly single-pass.
 Modifications in this variant:
 1. Green-Weighted Manhattan Distance for perceptual error checks.
 2. Chroma-Biased Lossy Runs: Micro-gradients are squashed into runs.
-3. Lossy Indexing: Pixels snap to perceptually similar palette colors.
+3. Lossy Indexing: Pixels snap to perceptually similar palette colors using a locality-sensitive hash (bottom 3 bits masked).
 4. Base Pixel Hash Injection: State tracking uses substituted/quantized values.
 5. Repurposed Diff Ranges: QOI_OP_DIFF encodes {-4, -3, 2, 3}.
 6. Scaled QOI_OP_LUMA: Delta Green is bit-shifted, doubling the range to [-64, 63].
@@ -102,7 +102,8 @@ Implementation */
 
 #define QOI_MASK_2    0xc0 /* 11000000 */
 
-#define QOI_COLOR_HASH(C) (C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
+/* Updated to a Locality-Sensitive Hash: masks out the bottom 3 bits of RGB so similar colors collide */
+#define QOI_COLOR_HASH(C) (((C.rgba.r & 0xf8)*3 + (C.rgba.g & 0xf8)*5 + (C.rgba.b & 0xf8)*7 + C.rgba.a*11))
 #define QOI_MAGIC \
     (((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
      ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
