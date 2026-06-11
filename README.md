@@ -14,7 +14,7 @@ The original QOI format is strictly lossless, which limits its compression capab
 
 **LQOI makes QOI lossy.** By applying targeted, human-vision-biased quantization during encoding, LQOI massively increases the hit-rate of QOI's most efficient opcodes (`QOI_OP_RUN` and `QOI_OP_INDEX`).
 
-The primary design constraint of LQOI is performance: the modifications require **no dynamic state synchronization** in the decoder. All perceptual checks are confined to the encode pass, and the encoder uses channel-specialized hot loops with branchless, shallow perceptual gates to keep them cheap. The encoder also deliberately favours *long stretches of the same chunk type* (run hysteresis): this simultaneously shrinks the stream and keeps both coders' branch predictors on known paths, so LQOI decodes **at lossless-QOI speed** while producing files **1.29× smaller than lossless QOI** at ~48 dB PSNR (see benchmarks below).
+The primary design constraint of LQOI is performance: the modifications require **no dynamic state synchronization** in the decoder. All perceptual checks are confined to the encode pass, and the encoder uses channel-specialized hot loops with branchless, shallow perceptual gates to keep them cheap. The encoder also deliberately favours *long stretches of the same chunk type* (run hysteresis): this simultaneously shrinks the stream and keeps both coders' branch predictors on known paths, so LQOI runs **at lossless-QOI throughput** (decode faster, encode within ~1%) while producing files **1.35× smaller than lossless QOI** at ~47 dB PSNR (see benchmarks below).
 
 ### Benchmark Results
 
@@ -22,27 +22,27 @@ Measured on the [Kodak True Color suite](http://r0k.us/graphics/kodak/) (24 phot
 
 | Codec | Compression | Size vs raw | Fidelity (PSNR) | Decode | Encode |
 |-------|-------------|-------------|-----------------|--------|--------|
-| QOI (lossless) | 1.72× | 58.3% | ∞ (lossless) | 294 Mpx/s | 216 Mpx/s |
-| **LQOI (lossy)** | **2.22×** | **45.1%** | **48.20 dB** | **297 Mpx/s (+1%)** | **202 Mpx/s (−7%)** |
+| QOI (lossless) | 1.72× | 58.3% | ∞ (lossless) | 293 Mpx/s | 217 Mpx/s |
+| **LQOI (lossy)** | **2.31×** | **43.3%** | **47.06 dB** | **311 Mpx/s (+6%)** | **214 Mpx/s (−1%)** |
 
-LQOI produces files **22.7% smaller than lossless QOI** (1.29×) while reconstructing every pixel within its perceptual budget (green-weighted error ≤ 8, alpha exact) — ~48 dB PSNR is visually near-lossless. Decode runs at lossless-QOI speed; encode pays ~7% for the perceptual checks.
+LQOI produces files **25.7% smaller than lossless QOI** (1.35×) while reconstructing every pixel within its perceptual budget (green-weighted error ≤ 10, alpha exact) — ~47 dB PSNR is visually near-lossless. Decode is ~6% *faster* than lossless QOI; encode is within ~1%.
 
-Two encoder-only dials trade fidelity for size and speed (every setting produces streams readable by the same decoder):
+The main dial is the run-continuation budget, an encoder-only setting (every value produces streams readable by the same decoder):
 
-| Dial | Setting | Size vs QOI | PSNR | Encode | Decode |
-|------|---------|-------------|------|--------|--------|
-| `QOI_RUN_CONT_T` | 6 (no hysteresis) | 80.5% | 49.15 dB | 196 Mpx/s | 274 Mpx/s |
-| | **8 (default)** | **77.3%** | **48.20 dB** | **202 Mpx/s** | **297 Mpx/s** |
-| | 10 | 74.3% | 47.06 dB | 213 Mpx/s | 310 Mpx/s |
-| `QOI_LUMA1_T` | 0 (exact only) | +size | +PSNR | | |
-| | **1 (default)** | | | | |
+| `QOI_RUN_CONT_T` | Size vs QOI | PSNR | Encode | Decode |
+|------|-------------|------|--------|--------|
+| 6 (no hysteresis) | 80.5% | 49.15 dB | 196 Mpx/s | 274 Mpx/s |
+| 8 | 77.3% | 48.20 dB | 202 Mpx/s | 297 Mpx/s |
+| **10 (default)** | **74.3%** | **47.06 dB** | **214 Mpx/s** | **311 Mpx/s** |
+
+(`QOI_LUMA1_T` is a second, finer dial on the 1-byte luma-step chunk; see `qoi.h`.)
 
 See [`BENCHMARKING.md`](BENCHMARKING.md) to reproduce (`./run_benchmark.sh`).
 
 ### The Six Mechanisms of LQOI
 
 1. **Green-Weighted Manhattan Distance:** Replaces exact-match checks with a branchless L1 norm error threshold ($2|\Delta G| + |\Delta R| + |\Delta B| \le 6$). Alpha must remain exact.
-2. **Chroma-Biased Lossy Runs with Hysteresis:** Micro-gradients are squashed into `QOI_OP_RUN` chunks. The run continues as long as the current pixel remains within the perceptual threshold of the *first* pixel in the run, preventing compounding drift. A run *starts* only within the strict budget (`QOI_RUN_START_T`, default 6) but *continues* within a looser one (`QOI_RUN_CONT_T`, default 8): runs stretch over more pixels, so the stream has fewer chunks — files get smaller **and** both coders get faster, because longer same-chunk stretches keep the branch predictors on known paths.
+2. **Chroma-Biased Lossy Runs with Hysteresis:** Micro-gradients are squashed into `QOI_OP_RUN` chunks. The run continues as long as the current pixel remains within the perceptual threshold of the *first* pixel in the run, preventing compounding drift. A run *starts* only within the strict budget (`QOI_RUN_START_T`, default 6) but *continues* within a looser one (`QOI_RUN_CONT_T`, default 10): runs stretch over more pixels, so the stream has fewer chunks — files get smaller **and** both coders get faster, because longer same-chunk stretches keep the branch predictors on known paths.
 3. **Lossy Indexing (Snap to Palette):** Pixels evaluate a locality-sensitive version of the standard QOI hash. If the stored pixel is perceptually close (within the threshold), the pixel "snaps" to the palette color via `QOI_OP_INDEX`.
 4. **Base Pixel Hash Injection:** When a pixel is quantized, the encoder injects the *substituted* value into the hash array, standardizing the palette and eliminating decoder mismatch.
 5. **Scaled `QOI_OP_LUMA`:** The Green channel payload is bit-shifted (`val >> 1`), doubling its effective reach to `[-64, 63]` and allowing medium-contrast edges to be captured in 2 bytes instead of 4.

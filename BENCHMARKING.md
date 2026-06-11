@@ -74,9 +74,9 @@ artifacts, datasets, results) is gitignored under `vendor/`, `images/` and
 
 ## Latest results (Kodak, 24 images)
 
-Overall PSNR **48.20 dB**, LQOI **77.3%** of strictly-lossless QOI size (1.29×
-smaller). Speed vs lossless QOI: **decode +1%** (297 vs 294 Mpx/s), **encode
-~−7%** (202 vs 216 Mpx/s). Max perceptual error **8/8** (the run-continuation
+Overall PSNR **47.06 dB**, LQOI **74.3%** of strictly-lossless QOI size (1.35×
+smaller). Speed vs lossless QOI: **decode +6%** (311 vs 293 Mpx/s), **encode
+−1%** (214 vs 217 Mpx/s). Max perceptual error **10/10** (the run-continuation
 budget) with **0** pixels exceeding it and alpha exact — the encode→decode
 loop is verified correct. See `results/RESULTS.md` for the full table.
 
@@ -86,8 +86,8 @@ with the same decoder) measured on the same setup:
 | `QOI_RUN_CONT_T` | size vs QOI | PSNR | encode | decode |
 |---|---|---|---|---|
 | 6 (no hysteresis) | 80.5% | 49.15 dB | 196 Mpx/s | 274 Mpx/s |
-| **8 (default)** | **77.3%** | **48.20 dB** | **202 Mpx/s** | **297 Mpx/s** |
-| 10 | 74.3% | 47.06 dB | 213 Mpx/s | 310 Mpx/s |
+| 8 | 77.3% | 48.20 dB | 202 Mpx/s | 297 Mpx/s |
+| **10 (default)** | **74.3%** | **47.06 dB** | **214 Mpx/s** | **311 Mpx/s** |
 
 History of findings made with this benchmark:
 
@@ -109,7 +109,8 @@ History of findings made with this benchmark:
 > the shipped shallow branchless gate recovers nearly all of it.
 
 > The throughput cost of the richer chunk mix was diagnosed as branch entropy,
-> which led to the run hysteresis (start ≤ 6, continue ≤ 8): longer runs mean
+> which led to the run hysteresis (start ≤ `QOI_RUN_START_T`, continue within
+> the looser `QOI_RUN_CONT_T`): longer runs mean
 > fewer chunks and longer same-chunk stretches, recovering decode to lossless-
 > QOI speed while *also* shrinking files ~4%. The decoder additionally
 > burst-writes runs, emits pixels as single 4-byte stores, and skips palette

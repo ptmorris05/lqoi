@@ -16,7 +16,7 @@ Modifications in this variant:
 1. Green-Weighted Manhattan Distance for perceptual error checks.
 2. Chroma-Biased Lossy Runs with hysteresis: Micro-gradients are squashed
    into runs. A run starts only within the strict budget (QOI_RUN_START_T,
-   default 6) but continues within a looser one (QOI_RUN_CONT_T, default 8),
+   default 6) but continues within a looser one (QOI_RUN_CONT_T, default 10),
    stretching runs over more pixels: fewer chunks, smaller files, and longer
    same-chunk stretches that keep both coders' branch predictors on track.
 3. Lossy Indexing: Pixels snap to perceptually similar palette colors using a locality-sensitive hash (bottom 3 bits masked).
@@ -127,7 +127,7 @@ dr_dg and db_dg are calculated relative to the DECODED green difference.
 6-bit run-length repeating the previous pixel (or perceptually similar): 1..62
 
 The encoder starts a run only for pixels within QOI_RUN_START_T (default 6)
-of the run's base pixel, but continues it within QOI_RUN_CONT_T (default 8).
+of the run's base pixel, but continues it within QOI_RUN_CONT_T (default 10).
 The continuation budget is the loosest per-pixel error bound of the codec.
 
 .- QOI_OP_RGB / RGBA ------.
@@ -212,7 +212,7 @@ Implementation */
     #define QOI_RUN_START_T 6
 #endif
 #ifndef QOI_RUN_CONT_T
-    #define QOI_RUN_CONT_T 8
+    #define QOI_RUN_CONT_T 10
 #endif
 
 /* Updated to a Locality-Sensitive Hash: masks out the bottom 3 bits of RGB so similar colors collide */
