@@ -74,15 +74,36 @@ artifacts, datasets, results) is gitignored under `vendor/`, `images/` and
 
 ## Latest results (Kodak, 24 images)
 
-Overall PSNR **48.86 dB**, LQOI **88.6%** of strictly-lossless QOI size. Speed
-vs lossless QOI: **decode ~+7%** (326 vs 305 Mpx/s), **encode ~−7%** (203 vs
-220 Mpx/s) — the smaller stream decodes faster, and channel-specialized encode
-loops keep the per-pixel perceptual checks cheap enough to stay within ~7% on
-encode. Max perceptual error **6/6** with **0** pixels exceeding the budget and
-alpha exact — the encode→decode loop is verified correct. See
-`results/RESULTS.md` for the full table.
+Overall PSNR **49.15 dB**, LQOI **80.5%** of strictly-lossless QOI size (1.24×
+smaller). Speed vs lossless QOI: **encode ~−10%** (196 vs 218 Mpx/s), **decode
+~−11%** (274 vs 306 Mpx/s). Max perceptual error **6/6** with **0** pixels
+exceeding the budget and alpha exact — the encode→decode loop is verified
+correct. See `results/RESULTS.md` for the full table.
 
-> Note: the comprehensive benchmark's correctness gate caught a real
-> `QOI_OP_LUMA` green-channel wraparound bug (a 1-level quantization error at the
-> channel floor wrapped `0 → 255`), which has been fixed in `qoi.h`. The fix
-> raised the green-channel PSNR from 44.6 → 49.8 dB at no size cost.
+The `QOI_OP_LUMA1` strength dial (`-DQOI_LUMA1_T=N`, encoder-only, all values
+decode with the same decoder) measured on the same setup:
+
+| `QOI_LUMA1_T` | size vs QOI | PSNR | encode |
+|---|---|---|---|
+| 0 (exact only) | 84.7% | 49.20 dB | 184 Mpx/s |
+| **1 (default)** | **80.5%** | **49.15 dB** | **196 Mpx/s** |
+| 2 | 76.9% | 48.67 dB | 180 Mpx/s |
+
+History of findings made with this benchmark:
+
+> The correctness gate caught a real `QOI_OP_LUMA` green-channel wraparound bug
+> (a 1-level quantization error at the channel floor wrapped `0 → 255`), fixed
+> in `qoi.h`; the fix raised green-channel PSNR from 44.6 → 49.8 dB at no size
+> cost.
+
+> Throughput measurements drove the encoder's branchless restructuring (mod-256
+> unsigned gates, OR-combined range checks, pointer emission, incremental hash
+> updates): bitstream-identical, encode 205 → 227 Mpx/s, briefly making LQOI
+> encode ~4% *faster* than lossless QOI before that headroom was spent on
+> `QOI_OP_LUMA1`.
+
+> The chunk census (LUMA pairs = 68% of stream bytes, `QOI_OP_DIFF` < 1% of
+> chunks) motivated repurposing the DIFF tag as the 1-byte `QOI_OP_LUMA1`,
+> which cut file size ~9% while *raising* PSNR. Encoder-side, naive early-out
+> gating of the new chunk cost 23% encode throughput in branch mispredictions;
+> the shipped shallow branchless gate recovers nearly all of it.

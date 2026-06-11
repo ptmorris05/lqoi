@@ -18,7 +18,13 @@ Modifications in this variant:
 3. Lossy Indexing: Pixels snap to perceptually similar palette colors using a locality-sensitive hash (bottom 3 bits masked).
 4. Base Pixel Hash Injection: State tracking uses substituted/quantized values.
 5. Scaled QOI_OP_LUMA: Delta Green is bit-shifted, doubling the range to [-64, 63].
-(Note: QOI_OP_DIFF remains the standard exact [-2, 1] range to accurately encode flat color channels without introducing artificial color tints).
+6. QOI_OP_LUMA1 (repurposes the QOI_OP_DIFF tag): a 1-byte luma step with an
+   exact 4-bit green delta and a shared 2-bit chroma correction applied to r
+   and b. The encoder uses it only when the total r+b error is at most
+   QOI_LUMA1_T (default 1). It is tried before the palette, so it replaces
+   both 2-byte LUMA chunks and lossier INDEX snaps -- smaller files AND
+   higher PSNR than the exact DIFF op it replaces (which the lossy RUN had
+   made nearly dead: <1% of chunks).
 
 -- Synopsis
 
@@ -59,7 +65,8 @@ struct qoi_header_t {
 Pixels are encoded as
  - a run of pixels perceptually similar to the previous pixel
  - an index into an array of perceptually similar previously seen pixels
- - a quantized difference to the previous pixel value in r,g,b
+ - a luma step from the previous pixel: an exact green delta plus a chroma
+   correction, in one byte (LUMA1) or two (LUMA)
  - full r,g,b or r,g,b,a values
 
 .- QOI_OP_INDEX ----------.
@@ -71,22 +78,25 @@ Pixels are encoded as
 2-bit tag b00
 6-bit index into the color index array: 0..63
 
-.- QOI_OP_DIFF -----------.
+.- QOI_OP_LUMA1 ----------.
 |         Byte[0]         |
 |  7  6  5  4  3  2  1  0 |
-|-------+-----+-----+-----|
-|  0  1 |  dr |  dg |  db |
+|-------+-----------+-----|
+|  0  1 |    dg     |  c  |
 `-------------------------`
-2-bit tag b01
-2-bit   red channel difference from the previous pixel between -2..1
-2-bit green channel difference from the previous pixel between -2..1
-2-bit  blue channel difference from the previous pixel between -2..1
+2-bit tag b01 (repurposes the original QOI_OP_DIFF tag)
+4-bit green channel difference from the previous pixel -8..7 (exact)
+2-bit chroma correction -2..1, applied on top of dg to red and blue
 
-The difference to the current channel values are using a wraparound operation,
-so "1 - 2" will result in 255, while "255 + 1" will result in 0.
+The decoded values are
+    r = prev.r + dg + c
+    g = prev.g + dg
+    b = prev.b + dg + c
 
-Values are stored as unsigned integers with a bias of 2. E.g. -2 is stored as
-0 (b00). 1 is stored as 3 (b11).
+All additions wrap around (mod 256). dg is stored with a bias of 8, c with a
+bias of 2. Green is always reconstructed exactly; the encoder only emits this
+chunk when the combined red+blue error is within its perceptual budget
+(QOI_LUMA1_T, default 1).
 
 .- QOI_OP_LUMA -------------------------------------.
 |         Byte[0]         |         Byte[1]         |
@@ -166,13 +176,23 @@ Implementation */
 #endif
 
 #define QOI_OP_INDEX  0x00 /* 00xxxxxx */
-#define QOI_OP_DIFF   0x40 /* 01xxxxxx */
+#define QOI_OP_LUMA1  0x40 /* 01xxxxxx */
 #define QOI_OP_LUMA   0x80 /* 10xxxxxx */
 #define QOI_OP_RUN    0xc0 /* 11xxxxxx */
 #define QOI_OP_RGB    0xfe /* 11111110 */
 #define QOI_OP_RGBA   0xff /* 11111111 */
 
 #define QOI_MASK_2    0xc0 /* 11000000 */
+
+/* Perceptual budget of QOI_OP_LUMA1: max combined |err_r| + |err_b| the
+   encoder accepts for the 1-byte luma-step chunk (green is always exact).
+   This is an encoder-only dial -- streams produced with any budget decode
+   with the same decoder. On Kodak: 1 (default) improves BOTH size and PSNR
+   over the old exact-DIFF codec; 0 allows only exact hits (highest PSNR,
+   smaller size win); 2 trades ~0.5 dB for another ~4% of size. */
+#ifndef QOI_LUMA1_T
+    #define QOI_LUMA1_T 1
+#endif
 
 /* Updated to a Locality-Sensitive Hash: masks out the bottom 3 bits of RGB so similar colors collide */
 #define QOI_COLOR_HASH(C) (((C.rgba.r & 0xf8)*3 + (C.rgba.g & 0xf8)*5 + (C.rgba.b & 0xf8)*7 + C.rgba.a*11))
@@ -208,7 +228,7 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
     int i, max_size, p, run;
     int px_len, px_end, px_pos, channels;
-    unsigned char *bytes;
+    unsigned char *bytes, *op;
     const unsigned char *pixels;
     qoi_rgba_t index[64];
     qoi_rgba_t px, px_prev;
@@ -252,14 +272,22 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
     px_len = desc->width * desc->height * desc->channels;
     px_end = px_len - desc->channels;
     channels = desc->channels;
+    op = bytes + p;
 
     /* The per-pixel hot path is split into two channel-specialized loops. For
        RGB input the alpha never varies, so the RGB loop drops the per-pixel
        alpha load and the three alpha comparisons (run / index / diff gates),
        which measurably speeds up encoding. The two loops are otherwise
        identical in behaviour and emit a bitstream-identical stream -- keep them
-       in sync if the encoding logic changes. The hash of px is reused for the
-       palette store (only the LUMA branch mutates px and needs a fresh hash). */
+       in sync if the encoding logic changes.
+
+       All channel deltas are kept as mod-256 values in unsigned int form
+       (d_r/u_vg/u_drdg/...) so the range gates compile to a single unsigned
+       compare with no sign extension; each gate is OR-combined into one
+       branch. The LUMA branch reconstructs r and b exactly and green as
+       g - (dg & 1), so instead of re-hashing the substituted pixel it adjusts
+       the green hash term in place (it moves by exactly -8*5 = -40 when and
+       only when bit 3 of green flips). */
     if (channels == 4) {
         for (px_pos = 0; px_pos < px_len; px_pos += 4) {
             px.rgba.r = pixels[px_pos + 0];
@@ -267,23 +295,71 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
             px.rgba.b = pixels[px_pos + 2];
             px.rgba.a = pixels[px_pos + 3];
 
+            int s_r = (int)px.rgba.r - (int)px_prev.rgba.r;
+            int s_g = (int)px.rgba.g - (int)px_prev.rgba.g;
+            int s_b = (int)px.rgba.b - (int)px_prev.rgba.b;
+
             /* 1 & 2. Chroma-Biased Lossy Runs using Green-Weighted Manhattan Distance */
-            int err_run = 2 * abs((int)px.rgba.g - (int)px_prev.rgba.g) +
-                              abs((int)px.rgba.r - (int)px_prev.rgba.r) +
-                              abs((int)px.rgba.b - (int)px_prev.rgba.b);
+            int err_run = 2 * abs(s_g) + abs(s_r) + abs(s_b);
 
             if (px.rgba.a == px_prev.rgba.a && err_run <= 6) {
                 run++;
                 if (run == 62 || px_pos == px_end) {
-                    bytes[p++] = QOI_OP_RUN | (run - 1);
+                    *op++ = QOI_OP_RUN | (run - 1);
                     run = 0;
                 }
                 continue; /* px_prev remains the base pixel */
             }
 
             if (run > 0) {
-                bytes[p++] = QOI_OP_RUN | (run - 1);
+                *op++ = QOI_OP_RUN | (run - 1);
                 run = 0;
+            }
+
+            /* 6. Chroma-Corrected Luma Step: 1-byte chunk with exact green and
+               a shared 2-bit r/b correction. Tried before the palette: a hit
+               here is at least as small as INDEX and far more accurate. */
+            {
+                unsigned int u_dg = (unsigned int)(s_g + 8) & 0xff;
+                int dgv = (int)u_dg - 8;
+                int x = (signed char)(s_r - dgv);    /* dr - dg, mod 256 */
+                int y = (signed char)(s_b - dgv);    /* db - dg, mod 256 */
+
+                /* The gate is shallow on purpose: the minimal r+b error for
+                   the best in-range correction c is |x-y| plus twice the gap
+                   between [min(x,y),max(x,y)] and [-2,1]; for small budgets it
+                   reduces to pure range checks. Everything deeper (the chosen
+                   correction, per-channel errors, wraparound) is only computed
+                   on a hit, off the always-taken path. */
+#if QOI_LUMA1_T == 0
+                int hit1 = (px.rgba.a == px_prev.rgba.a) & (u_dg <= 15) &
+                           (x == y) & ((unsigned int)(x + 2) <= 3);
+#elif QOI_LUMA1_T == 1
+                int hit1 = (px.rgba.a == px_prev.rgba.a) & (u_dg <= 15) &
+                           ((unsigned int)(x - y + 1) <= 2) &
+                           ((unsigned int)(x + y + 5) <= 8);
+#else
+                int lo1 = x < y ? x : y, hi1 = x < y ? y : x;
+                int gap1 = lo1 > 1 ? lo1 - 1 : (hi1 < -2 ? -2 - hi1 : 0);
+                int hit1 = (px.rgba.a == px_prev.rgba.a) & (u_dg <= 15) &
+                           ((hi1 - lo1) + 2 * gap1 <= QOI_LUMA1_T);
+#endif
+
+                if (hit1) {
+                    int c = x < -2 ? -2 : (x > 1 ? 1 : x);
+                    int e_r = x - c, e_b = y - c;
+                    int dec_r = (int)px.rgba.r - e_r;
+                    int dec_b = (int)px.rgba.b - e_b;
+                    /* the dropped error may not wrap r or b past the byte */
+                    if (((unsigned int)dec_r <= 255) & ((unsigned int)dec_b <= 255)) {
+                        *op++ = QOI_OP_LUMA1 | (u_dg << 2) | (c + 2);
+                        px.rgba.r = (unsigned char)dec_r;
+                        px.rgba.b = (unsigned char)dec_b;
+                        index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
+                        px_prev = px;
+                        continue;
+                    }
+                }
             }
 
             int index_pos = QOI_COLOR_HASH(px) & (64 - 1);
@@ -295,67 +371,56 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                               abs((int)px.rgba.b - (int)pal_px.rgba.b);
 
             if (px.rgba.a == pal_px.rgba.a && err_idx <= 6) {
-                bytes[p++] = QOI_OP_INDEX | index_pos;
+                *op++ = QOI_OP_INDEX | index_pos;
                 px = pal_px; /* 4. Base Pixel Hash Injection */
             }
             else {
                 int store_pos = index_pos;
 
                 if (px.rgba.a == px_prev.rgba.a) {
-                    signed char vr = px.rgba.r - px_prev.rgba.r;
-                    signed char vg = px.rgba.g - px_prev.rgba.g;
-                    signed char vb = px.rgba.b - px_prev.rgba.b;
+                    /* Scaled Luma (Doubled range via bitshift): u_vg = vg + 64 */
+                    {
+                        unsigned int u_vg = (unsigned int)(s_g + 64) & 0xff;
 
-                    /* Standard Diff Ranges [-2, 1] (Restored to prevent zero-hole tinting) */
-                    if (vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2) {
-                        bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
-                    }
-                    else {
-                        /* Scaled Luma (Doubled range via bitshift) */
-                        int encoded_dg = ((int)vg) >> 1;
+                        if (u_vg <= 127) {
+                            unsigned int odd = u_vg & 1;        /* the dropped green LSB */
+                            int dg2 = (int)u_vg - 64 - (int)odd; /* decoded green delta */
+                            unsigned int u_drdg = (unsigned int)(s_r - dg2 + 8) & 0xff;
+                            unsigned int u_dbdg = (unsigned int)(s_b - dg2 + 8) & 0xff;
+                            int g_sub = (int)px.rgba.g - (int)odd; /* reconstructed green */
 
-                        if (encoded_dg >= -32 && encoded_dg <= 31) {
-                            int decoded_dg = encoded_dg << 1;
-                            signed char dr_dg = vr - decoded_dg;
-                            signed char db_dg = vb - decoded_dg;
+                            /* g_sub < 0 is the one case where dropping the green
+                               LSB wraps the byte (0 -> 255); fall through to RGB. */
+                            if ((u_drdg | u_dbdg) <= 15 && g_sub >= 0) {
+                                *op++ = QOI_OP_LUMA | (u_vg >> 1);
+                                *op++ = (u_drdg << 4) | u_dbdg;
 
-                            /* Reject LUMA if the dropped green LSB would wrap the
-                               unsigned byte (0 -> 255); fall through to exact RGB. */
-                            int recon_g = (unsigned char)(px_prev.rgba.g + decoded_dg);
-                            int green_err = recon_g - (int)px.rgba.g;
-                            if (green_err < 0) green_err = -green_err;
-
-                            if (dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 &&
-                                green_err <= 1) {
-                                bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
-                                bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
-
-                                px.rgba.r = px_prev.rgba.r + decoded_dg + dr_dg;
-                                px.rgba.g = px_prev.rgba.g + decoded_dg;
-                                px.rgba.b = px_prev.rgba.b + decoded_dg + db_dg;
-                                store_pos = QOI_COLOR_HASH(px) & (64 - 1);
+                                /* r and b reconstruct exactly; only green moves (by odd) */
+                                store_pos = (index_pos -
+                                    (int)(((px.rgba.g ^ (unsigned int)g_sub) >> 3) & 1) * 40) & (64 - 1);
+                                px.rgba.g = (unsigned char)g_sub;
                             }
                             else {
-                                bytes[p++] = QOI_OP_RGB;
-                                bytes[p++] = px.rgba.r;
-                                bytes[p++] = px.rgba.g;
-                                bytes[p++] = px.rgba.b;
+                                *op++ = QOI_OP_RGB;
+                                *op++ = px.rgba.r;
+                                *op++ = px.rgba.g;
+                                *op++ = px.rgba.b;
                             }
                         }
                         else {
-                            bytes[p++] = QOI_OP_RGB;
-                            bytes[p++] = px.rgba.r;
-                            bytes[p++] = px.rgba.g;
-                            bytes[p++] = px.rgba.b;
+                            *op++ = QOI_OP_RGB;
+                            *op++ = px.rgba.r;
+                            *op++ = px.rgba.g;
+                            *op++ = px.rgba.b;
                         }
                     }
                 }
                 else {
-                    bytes[p++] = QOI_OP_RGBA;
-                    bytes[p++] = px.rgba.r;
-                    bytes[p++] = px.rgba.g;
-                    bytes[p++] = px.rgba.b;
-                    bytes[p++] = px.rgba.a;
+                    *op++ = QOI_OP_RGBA;
+                    *op++ = px.rgba.r;
+                    *op++ = px.rgba.g;
+                    *op++ = px.rgba.b;
+                    *op++ = px.rgba.a;
                 }
 
                 index[store_pos] = px;
@@ -370,23 +435,71 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
             px.rgba.g = pixels[px_pos + 1];
             px.rgba.b = pixels[px_pos + 2];
 
+            int s_r = (int)px.rgba.r - (int)px_prev.rgba.r;
+            int s_g = (int)px.rgba.g - (int)px_prev.rgba.g;
+            int s_b = (int)px.rgba.b - (int)px_prev.rgba.b;
+
             /* 1 & 2. Chroma-Biased Lossy Runs (alpha is constant for RGB) */
-            int err_run = 2 * abs((int)px.rgba.g - (int)px_prev.rgba.g) +
-                              abs((int)px.rgba.r - (int)px_prev.rgba.r) +
-                              abs((int)px.rgba.b - (int)px_prev.rgba.b);
+            int err_run = 2 * abs(s_g) + abs(s_r) + abs(s_b);
 
             if (err_run <= 6) {
                 run++;
                 if (run == 62 || px_pos == px_end) {
-                    bytes[p++] = QOI_OP_RUN | (run - 1);
+                    *op++ = QOI_OP_RUN | (run - 1);
                     run = 0;
                 }
                 continue; /* px_prev remains the base pixel */
             }
 
             if (run > 0) {
-                bytes[p++] = QOI_OP_RUN | (run - 1);
+                *op++ = QOI_OP_RUN | (run - 1);
                 run = 0;
+            }
+
+            /* 6. Chroma-Corrected Luma Step: 1-byte chunk with exact green and
+               a shared 2-bit r/b correction. Tried before the palette: a hit
+               here is at least as small as INDEX and far more accurate. */
+            {
+                unsigned int u_dg = (unsigned int)(s_g + 8) & 0xff;
+                int dgv = (int)u_dg - 8;
+                int x = (signed char)(s_r - dgv);    /* dr - dg, mod 256 */
+                int y = (signed char)(s_b - dgv);    /* db - dg, mod 256 */
+
+                /* The gate is shallow on purpose: the minimal r+b error for
+                   the best in-range correction c is |x-y| plus twice the gap
+                   between [min(x,y),max(x,y)] and [-2,1]; for small budgets it
+                   reduces to pure range checks. Everything deeper (the chosen
+                   correction, per-channel errors, wraparound) is only computed
+                   on a hit, off the always-taken path. */
+#if QOI_LUMA1_T == 0
+                int hit1 = (u_dg <= 15) &
+                           (x == y) & ((unsigned int)(x + 2) <= 3);
+#elif QOI_LUMA1_T == 1
+                int hit1 = (u_dg <= 15) &
+                           ((unsigned int)(x - y + 1) <= 2) &
+                           ((unsigned int)(x + y + 5) <= 8);
+#else
+                int lo1 = x < y ? x : y, hi1 = x < y ? y : x;
+                int gap1 = lo1 > 1 ? lo1 - 1 : (hi1 < -2 ? -2 - hi1 : 0);
+                int hit1 = (u_dg <= 15) &
+                           ((hi1 - lo1) + 2 * gap1 <= QOI_LUMA1_T);
+#endif
+
+                if (hit1) {
+                    int c = x < -2 ? -2 : (x > 1 ? 1 : x);
+                    int e_r = x - c, e_b = y - c;
+                    int dec_r = (int)px.rgba.r - e_r;
+                    int dec_b = (int)px.rgba.b - e_b;
+                    /* the dropped error may not wrap r or b past the byte */
+                    if (((unsigned int)dec_r <= 255) & ((unsigned int)dec_b <= 255)) {
+                        *op++ = QOI_OP_LUMA1 | (u_dg << 2) | (c + 2);
+                        px.rgba.r = (unsigned char)dec_r;
+                        px.rgba.b = (unsigned char)dec_b;
+                        index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
+                        px_prev = px;
+                        continue;
+                    }
+                }
             }
 
             int index_pos = QOI_COLOR_HASH(px) & (64 - 1);
@@ -398,58 +511,47 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
                               abs((int)px.rgba.b - (int)pal_px.rgba.b);
 
             if (err_idx <= 6) {
-                bytes[p++] = QOI_OP_INDEX | index_pos;
+                *op++ = QOI_OP_INDEX | index_pos;
                 px = pal_px; /* 4. Base Pixel Hash Injection */
             }
             else {
                 int store_pos = index_pos;
 
-                signed char vr = px.rgba.r - px_prev.rgba.r;
-                signed char vg = px.rgba.g - px_prev.rgba.g;
-                signed char vb = px.rgba.b - px_prev.rgba.b;
+                /* Scaled Luma (Doubled range via bitshift): u_vg = vg + 64 */
+                {
+                    unsigned int u_vg = (unsigned int)(s_g + 64) & 0xff;
 
-                /* Standard Diff Ranges [-2, 1] (Restored to prevent zero-hole tinting) */
-                if (vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2) {
-                    bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
-                }
-                else {
-                    /* Scaled Luma (Doubled range via bitshift) */
-                    int encoded_dg = ((int)vg) >> 1;
+                    if (u_vg <= 127) {
+                        unsigned int odd = u_vg & 1;        /* the dropped green LSB */
+                        int dg2 = (int)u_vg - 64 - (int)odd; /* decoded green delta */
+                        unsigned int u_drdg = (unsigned int)(s_r - dg2 + 8) & 0xff;
+                        unsigned int u_dbdg = (unsigned int)(s_b - dg2 + 8) & 0xff;
+                        int g_sub = (int)px.rgba.g - (int)odd; /* reconstructed green */
 
-                    if (encoded_dg >= -32 && encoded_dg <= 31) {
-                        int decoded_dg = encoded_dg << 1;
-                        signed char dr_dg = vr - decoded_dg;
-                        signed char db_dg = vb - decoded_dg;
-
-                        /* Reject LUMA if the dropped green LSB would wrap the
-                           unsigned byte (0 -> 255); fall through to exact RGB.
+                        /* g_sub < 0 is the one case where dropping the green
+                           LSB wraps the byte (0 -> 255); fall through to RGB.
                            r and b are exact mod 256 regardless; decoder unchanged. */
-                        int recon_g = (unsigned char)(px_prev.rgba.g + decoded_dg);
-                        int green_err = recon_g - (int)px.rgba.g;
-                        if (green_err < 0) green_err = -green_err;
+                        if ((u_drdg | u_dbdg) <= 15 && g_sub >= 0) {
+                            *op++ = QOI_OP_LUMA | (u_vg >> 1);
+                            *op++ = (u_drdg << 4) | u_dbdg;
 
-                        if (dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 &&
-                            green_err <= 1) {
-                            bytes[p++] = QOI_OP_LUMA | (encoded_dg + 32);
-                            bytes[p++] = (dr_dg + 8) << 4 | (db_dg + 8);
-
-                            px.rgba.r = px_prev.rgba.r + decoded_dg + dr_dg;
-                            px.rgba.g = px_prev.rgba.g + decoded_dg;
-                            px.rgba.b = px_prev.rgba.b + decoded_dg + db_dg;
-                            store_pos = QOI_COLOR_HASH(px) & (64 - 1);
+                            /* r and b reconstruct exactly; only green moves (by odd) */
+                            store_pos = (index_pos -
+                                (int)(((px.rgba.g ^ (unsigned int)g_sub) >> 3) & 1) * 40) & (64 - 1);
+                            px.rgba.g = (unsigned char)g_sub;
                         }
                         else {
-                            bytes[p++] = QOI_OP_RGB;
-                            bytes[p++] = px.rgba.r;
-                            bytes[p++] = px.rgba.g;
-                            bytes[p++] = px.rgba.b;
+                            *op++ = QOI_OP_RGB;
+                            *op++ = px.rgba.r;
+                            *op++ = px.rgba.g;
+                            *op++ = px.rgba.b;
                         }
                     }
                     else {
-                        bytes[p++] = QOI_OP_RGB;
-                        bytes[p++] = px.rgba.r;
-                        bytes[p++] = px.rgba.g;
-                        bytes[p++] = px.rgba.b;
+                        *op++ = QOI_OP_RGB;
+                        *op++ = px.rgba.r;
+                        *op++ = px.rgba.g;
+                        *op++ = px.rgba.b;
                     }
                 }
 
@@ -461,10 +563,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
     }
 
     for (i = 0; i < (int)sizeof(qoi_padding); i++) {
-        bytes[p++] = qoi_padding[i];
+        *op++ = qoi_padding[i];
     }
 
-    *out_len = p;
+    *out_len = (int)(op - bytes);
     return bytes;
 }
 
@@ -527,37 +629,46 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
         else if (p < chunks_len) {
             int b1 = bytes[p++];
 
-            if (b1 == QOI_OP_RGB) {
-                px.rgba.r = bytes[p++];
-                px.rgba.g = bytes[p++];
-                px.rgba.b = bytes[p++];
-            }
-            else if (b1 == QOI_OP_RGBA) {
-                px.rgba.r = bytes[p++];
-                px.rgba.g = bytes[p++];
-                px.rgba.b = bytes[p++];
-                px.rgba.a = bytes[p++];
-            }
-            else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
-                px = index[b1];
-            }
-            else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-                px.rgba.r += ((b1 >> 4) & 0x03) - 2;
-                px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-                px.rgba.b += ( b1       & 0x03) - 2;
-            }
-            else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
-                /* Decode Scaled Luma Ranges */
+            /* 4-way dispatch on the 2-bit tag; RGB/RGBA share the RUN tag
+               bits, so that arm distinguishes them before assuming RUN. */
+            switch (b1 >> 6) {
+            case 2: { /* QOI_OP_LUMA: Decode Scaled Luma Ranges */
                 int b2 = bytes[p++];
                 int encoded_dg = (b1 & 0x3f) - 32;
                 int decoded_dg = encoded_dg << 1;
-                
+
                 px.rgba.r += decoded_dg - 8 + ((b2 >> 4) & 0x0f);
                 px.rgba.g += decoded_dg;
                 px.rgba.b += decoded_dg - 8 +  (b2       & 0x0f);
+                break;
             }
-            else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
-                run = (b1 & 0x3f);
+            case 1: { /* QOI_OP_LUMA1: exact green delta + shared r/b correction */
+                int dg1 = ((b1 >> 2) & 0x0f) - 8;
+                int c1  = ( b1       & 0x03) - 2;
+                px.rgba.r += dg1 + c1;
+                px.rgba.g += dg1;
+                px.rgba.b += dg1 + c1;
+                break;
+            }
+            case 0: /* QOI_OP_INDEX */
+                px = index[b1];
+                break;
+            default: /* QOI_OP_RUN / QOI_OP_RGB / QOI_OP_RGBA */
+                if (b1 == QOI_OP_RGB) {
+                    px.rgba.r = bytes[p++];
+                    px.rgba.g = bytes[p++];
+                    px.rgba.b = bytes[p++];
+                }
+                else if (b1 == QOI_OP_RGBA) {
+                    px.rgba.r = bytes[p++];
+                    px.rgba.g = bytes[p++];
+                    px.rgba.b = bytes[p++];
+                    px.rgba.a = bytes[p++];
+                }
+                else {
+                    run = (b1 & 0x3f);
+                }
+                break;
             }
 
             index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
