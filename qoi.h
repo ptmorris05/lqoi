@@ -14,7 +14,11 @@ with minimal performance overhead. It stays strictly single-pass.
 
 Modifications in this variant:
 1. Green-Weighted Manhattan Distance for perceptual error checks.
-2. Chroma-Biased Lossy Runs: Micro-gradients are squashed into runs.
+2. Chroma-Biased Lossy Runs with hysteresis: Micro-gradients are squashed
+   into runs. A run starts only within the strict budget (QOI_RUN_START_T,
+   default 6) but continues within a looser one (QOI_RUN_CONT_T, default 8),
+   stretching runs over more pixels: fewer chunks, smaller files, and longer
+   same-chunk stretches that keep both coders' branch predictors on track.
 3. Lossy Indexing: Pixels snap to perceptually similar palette colors using a locality-sensitive hash (bottom 3 bits masked).
 4. Base Pixel Hash Injection: State tracking uses substituted/quantized values.
 5. Scaled QOI_OP_LUMA: Delta Green is bit-shifted, doubling the range to [-64, 63].
@@ -122,6 +126,10 @@ dr_dg and db_dg are calculated relative to the DECODED green difference.
 2-bit tag b11
 6-bit run-length repeating the previous pixel (or perceptually similar): 1..62
 
+The encoder starts a run only for pixels within QOI_RUN_START_T (default 6)
+of the run's base pixel, but continues it within QOI_RUN_CONT_T (default 8).
+The continuation budget is the loosest per-pixel error bound of the codec.
+
 .- QOI_OP_RGB / RGBA ------.
 (Identical to standard QOI format: b11111110 / b11111111 followed by raw bytes)
 
@@ -192,6 +200,19 @@ Implementation */
    smaller size win); 2 trades ~0.5 dB for another ~4% of size. */
 #ifndef QOI_LUMA1_T
     #define QOI_LUMA1_T 1
+#endif
+
+/* Lossy-run budgets (green-weighted Manhattan distance vs the run's base
+   pixel). A run STARTS only within the strict budget, but may CONTINUE within
+   a slightly larger one. This hysteresis stretches runs over more pixels, so
+   the stream has fewer chunks: files get smaller AND both coders get faster
+   (longer same-chunk stretches keep the branch predictors on known paths).
+   Encoder-only dials; QOI_RUN_CONT_T is the codec's perceptual error bound. */
+#ifndef QOI_RUN_START_T
+    #define QOI_RUN_START_T 6
+#endif
+#ifndef QOI_RUN_CONT_T
+    #define QOI_RUN_CONT_T 8
 #endif
 
 /* Updated to a Locality-Sensitive Hash: masks out the bottom 3 bits of RGB so similar colors collide */
@@ -302,7 +323,8 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
             /* 1 & 2. Chroma-Biased Lossy Runs using Green-Weighted Manhattan Distance */
             int err_run = 2 * abs(s_g) + abs(s_r) + abs(s_b);
 
-            if (px.rgba.a == px_prev.rgba.a && err_run <= 6) {
+            if (px.rgba.a == px_prev.rgba.a &&
+                err_run <= (run ? QOI_RUN_CONT_T : QOI_RUN_START_T)) {
                 run++;
                 if (run == 62 || px_pos == px_end) {
                     *op++ = QOI_OP_RUN | (run - 1);
@@ -442,7 +464,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
             /* 1 & 2. Chroma-Biased Lossy Runs (alpha is constant for RGB) */
             int err_run = 2 * abs(s_g) + abs(s_r) + abs(s_b);
 
-            if (err_run <= 6) {
+            if (err_run <= (run ? QOI_RUN_CONT_T : QOI_RUN_START_T)) {
                 run++;
                 if (run == 62 || px_pos == px_end) {
                     *op++ = QOI_OP_RUN | (run - 1);
@@ -610,7 +632,10 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
     }
 
     px_len = desc->width * desc->height * channels;
-    pixels = (unsigned char *) QOI_MALLOC(px_len);
+    /* one byte of slack so every pixel (RGB or RGBA) can be written with a
+       single 4-byte store; for 3-channel output the 4th byte is overwritten
+       by the next pixel and the final one lands in the slack byte */
+    pixels = (unsigned char *) QOI_MALLOC(px_len + 1);
     if (!pixels) {
         return NULL;
     }
@@ -622,15 +647,18 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
     px.rgba.a = 255;
 
     chunks_len = size - (int)sizeof(qoi_padding);
-    for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-        if (run > 0) {
-            run--;
-        }
-        else if (p < chunks_len) {
+    for (px_pos = 0; px_pos < px_len; ) {
+        if (p < chunks_len) {
             int b1 = bytes[p++];
 
             /* 4-way dispatch on the 2-bit tag; RGB/RGBA share the RUN tag
-               bits, so that arm distinguishes them before assuming RUN. */
+               bits, so that arm distinguishes them before assuming RUN.
+
+               The palette re-store happens only in the arms that produce a
+               new pixel value. Every palette entry satisfies the invariant
+               hash(entry) == slot (both coders only ever store a value at
+               its own hash), so after INDEX the store would be a no-op, and
+               after RUN px is unchanged and already stored. */
             switch (b1 >> 6) {
             case 2: { /* QOI_OP_LUMA: Decode Scaled Luma Ranges */
                 int b2 = bytes[p++];
@@ -640,6 +668,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
                 px.rgba.r += decoded_dg - 8 + ((b2 >> 4) & 0x0f);
                 px.rgba.g += decoded_dg;
                 px.rgba.b += decoded_dg - 8 +  (b2       & 0x0f);
+                index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
                 break;
             }
             case 1: { /* QOI_OP_LUMA1: exact green delta + shared r/b correction */
@@ -648,6 +677,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
                 px.rgba.r += dg1 + c1;
                 px.rgba.g += dg1;
                 px.rgba.b += dg1 + c1;
+                index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
                 break;
             }
             case 0: /* QOI_OP_INDEX */
@@ -658,28 +688,29 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
                     px.rgba.r = bytes[p++];
                     px.rgba.g = bytes[p++];
                     px.rgba.b = bytes[p++];
+                    index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
                 }
                 else if (b1 == QOI_OP_RGBA) {
                     px.rgba.r = bytes[p++];
                     px.rgba.g = bytes[p++];
                     px.rgba.b = bytes[p++];
                     px.rgba.a = bytes[p++];
+                    index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
                 }
                 else {
                     run = (b1 & 0x3f);
                 }
                 break;
             }
-
-            index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
         }
 
-        pixels[px_pos + 0] = px.rgba.r;
-        pixels[px_pos + 1] = px.rgba.g;
-        pixels[px_pos + 2] = px.rgba.b;
-        
-        if (channels == 4) {
-            pixels[px_pos + 3] = px.rgba.a;
+        memcpy(pixels + px_pos, &px, 4);
+        px_pos += channels;
+
+        /* burst-write the rest of a run without re-entering the dispatch */
+        for (; run > 0 && px_pos < px_len; run--) {
+            memcpy(pixels + px_pos, &px, 4);
+            px_pos += channels;
         }
     }
 

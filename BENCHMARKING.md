@@ -74,20 +74,20 @@ artifacts, datasets, results) is gitignored under `vendor/`, `images/` and
 
 ## Latest results (Kodak, 24 images)
 
-Overall PSNR **49.15 dB**, LQOI **80.5%** of strictly-lossless QOI size (1.24×
-smaller). Speed vs lossless QOI: **encode ~−10%** (196 vs 218 Mpx/s), **decode
-~−11%** (274 vs 306 Mpx/s). Max perceptual error **6/6** with **0** pixels
-exceeding the budget and alpha exact — the encode→decode loop is verified
-correct. See `results/RESULTS.md` for the full table.
+Overall PSNR **48.20 dB**, LQOI **77.3%** of strictly-lossless QOI size (1.29×
+smaller). Speed vs lossless QOI: **decode +1%** (297 vs 294 Mpx/s), **encode
+~−7%** (202 vs 216 Mpx/s). Max perceptual error **8/8** (the run-continuation
+budget) with **0** pixels exceeding it and alpha exact — the encode→decode
+loop is verified correct. See `results/RESULTS.md` for the full table.
 
-The `QOI_OP_LUMA1` strength dial (`-DQOI_LUMA1_T=N`, encoder-only, all values
-decode with the same decoder) measured on the same setup:
+The run-hysteresis dial (`-DQOI_RUN_CONT_T=N`, encoder-only, all values decode
+with the same decoder) measured on the same setup:
 
-| `QOI_LUMA1_T` | size vs QOI | PSNR | encode |
-|---|---|---|---|
-| 0 (exact only) | 84.7% | 49.20 dB | 184 Mpx/s |
-| **1 (default)** | **80.5%** | **49.15 dB** | **196 Mpx/s** |
-| 2 | 76.9% | 48.67 dB | 180 Mpx/s |
+| `QOI_RUN_CONT_T` | size vs QOI | PSNR | encode | decode |
+|---|---|---|---|---|
+| 6 (no hysteresis) | 80.5% | 49.15 dB | 196 Mpx/s | 274 Mpx/s |
+| **8 (default)** | **77.3%** | **48.20 dB** | **202 Mpx/s** | **297 Mpx/s** |
+| 10 | 74.3% | 47.06 dB | 213 Mpx/s | 310 Mpx/s |
 
 History of findings made with this benchmark:
 
@@ -107,3 +107,14 @@ History of findings made with this benchmark:
 > which cut file size ~9% while *raising* PSNR. Encoder-side, naive early-out
 > gating of the new chunk cost 23% encode throughput in branch mispredictions;
 > the shipped shallow branchless gate recovers nearly all of it.
+
+> The throughput cost of the richer chunk mix was diagnosed as branch entropy,
+> which led to the run hysteresis (start ≤ 6, continue ≤ 8): longer runs mean
+> fewer chunks and longer same-chunk stretches, recovering decode to lossless-
+> QOI speed while *also* shrinking files ~4%. The decoder additionally
+> burst-writes runs, emits pixels as single 4-byte stores, and skips palette
+> re-stores that the invariant hash(entry)==slot proves are no-ops (this also
+> fixed a latent seed-pixel palette desync on streams that begin with a run).
+> A "sticky LUMA1" variant (budget +1 inside unbroken LUMA1 stretches) was
+> evaluated and rejected: the loop-carried budget state serialized the encoder
+> (−11% encode) for only −1.8% size.

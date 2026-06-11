@@ -74,11 +74,11 @@ void *qoiref_decode(const void *data, int size, qoi_desc *desc, int channels);
 #endif
 
 /* The perceptual error budget the LQOI encoder enforces (must mirror qoi.h).
-   Green-weighted Manhattan: 2*|dG| + |dR| + |dB|. Runs and lossy-index snaps
-   keep each emitted pixel within this distance of its reference, so a correct
-   decoder must reproduce every pixel within this bound. LUMA only perturbs
-   green by the dropped low bit, which is well inside it. */
-#define LQOI_PERC_THRESHOLD 6
+   Green-weighted Manhattan: 2*|dG| + |dR| + |dB|. The loosest per-pixel bound
+   the encoder can emit is the run-continuation budget QOI_RUN_CONT_T (run
+   starts and lossy-index snaps stay within 6, LUMA/LUMA1 well inside), so a
+   correct decoder must reproduce every pixel within that bound. */
+#define LQOI_PERC_THRESHOLD QOI_RUN_CONT_T
 
 /* -----------------------------------------------------------------------------
    High resolution timer (from the original qoibench.c) */
