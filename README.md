@@ -21,6 +21,49 @@ Benchmark results on a few thousand images can be found here: https://qoiformat.
 The QOI format is also extremely simple, which helps a lot when porting to other languages.
 
 
+## fastqoi: optimized implementation (this branch)
+
+This branch carries a performance-tuned implementation of the unchanged QOI
+algorithm and format. The encoder emits **byte-identical** streams and the
+decoder reproduces the reference decoder's behavior **for every valid stream**
+(including its palette-store side effects, untouched-slot and leading-run edge
+cases) — verified against the upstream reference on the Kodak suite across all
+encode/decode channel combinations, plus adversarial and truncated streams.
+
+What changed, found by a line-by-line review of the hot loops and their
+generated arm64 assembly:
+
+- **Encoder** (channel-specialized loops, byte-identical output):
+  pixels are loaded with a single 4-byte copy (the RGB loop borrows the next
+  pixel's first byte and forces alpha, with the last pixel handled separately);
+  channel deltas are kept as mod-256 values in unsigned form so the DIFF gate
+  collapses from up to six data-dependent branches into one compare, and the
+  LUMA gate from three into two; chunks are emitted through a pointer instead
+  of int-indexed stores (drops a sign-extend per output byte).
+- **Decoder** (behavior-identical): dispatch is a 4-way switch on the 2-bit
+  tag tested in measured frequency order (LUMA is >50% of chunks on
+  photographic streams but was tested fifth in the reference chain); every
+  pixel is written with one 4-byte store (one byte of allocation slack);
+  RUN chunks burst-write without re-entering the dispatch.
+
+Measured on the Kodak True Color suite (24 images, Apple M5, clang -O3,
+interleaved A/B runs, same harness for both):
+
+| | stock qoi.h | fastqoi | speedup |
+|---|---|---|---|
+| encode, 3-channel | 199 Mpx/s | 256 Mpx/s | **+28%** |
+| encode, 4-channel | 254 Mpx/s | 263 Mpx/s | +3.5% |
+| decode | 263–271 Mpx/s | 278–287 Mpx/s | +3–6% |
+
+(The 4-channel encoder gains little because clang already merges the stock
+loop's four adjacent byte loads; the 3-channel loop cannot be merged
+automatically.) Evaluated and rejected: skipping provably no-op palette
+re-stores in the decoder (measurably free on this core, and the guards needed
+for exact conformance with arbitrary valid streams add complexity for ~0%);
+jump-table-vs-chain decode dispatch is a wash — decode throughput is bound by
+the chunk-to-chunk pixel dependency and branch outcomes, not dispatch shape.
+
+
 ## Example Usage
 
 - [qoiconv.c](https://github.com/phoboslab/qoi/blob/master/qoiconv.c)

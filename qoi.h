@@ -356,7 +356,7 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
+	unsigned char *bytes, *op;
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
@@ -402,86 +402,160 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	px_len = desc->width * desc->height * desc->channels;
 	px_end = px_len - desc->channels;
 	channels = desc->channels;
+	op = bytes + p;
 
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
-		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+	/* The per-pixel loop is specialized per channel count: the RGBA loop loads
+	   each pixel with a single 4-byte copy, and the RGB loop does the same for
+	   all but the last pixel (the 4th byte is the next pixel's red; alpha is
+	   then forced to 255, which it always is in the RGB loop). All channel
+	   deltas are kept as mod-256 values in unsigned form so each range gate
+	   (DIFF, LUMA) collapses into one compare with no sign extension, and
+	   chunks are emitted through a pointer instead of an indexed store.
+	   Both loops emit a stream byte-identical to the reference encoder. */
+	if (channels == 4) {
+		for (px_pos = 0; px_pos < px_len; px_pos += 4) {
+			memcpy(&px, pixels + px_pos, 4);
 
-		if (channels == 4) {
-			px.rgba.a = pixels[px_pos + 3];
-		}
-
-		if (px.v == px_prev.v) {
-			run++;
-			if (run == 62 || px_pos == px_end) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
-				run = 0;
-			}
-		}
-		else {
-			int index_pos;
-
-			if (run > 0) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
-				run = 0;
-			}
-
-			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
-
-			if (index[index_pos].v == px.v) {
-				bytes[p++] = QOI_OP_INDEX | index_pos;
+			if (px.v == px_prev.v) {
+				run++;
+				if (run == 62 || px_pos == px_end) {
+					*op++ = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
 			}
 			else {
-				index[index_pos] = px;
+				int index_pos;
 
-				if (px.rgba.a == px_prev.rgba.a) {
-					signed char vr = px.rgba.r - px_prev.rgba.r;
-					signed char vg = px.rgba.g - px_prev.rgba.g;
-					signed char vb = px.rgba.b - px_prev.rgba.b;
+				if (run > 0) {
+					*op++ = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
 
-					signed char vg_r = vr - vg;
-					signed char vg_b = vb - vg;
+				index_pos = QOI_COLOR_HASH(px) & (64 - 1);
 
-					if (
-						vr > -3 && vr < 2 &&
-						vg > -3 && vg < 2 &&
-						vb > -3 && vb < 2
-					) {
-						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
-					}
-					else if (
-						vg_r >  -9 && vg_r <  8 &&
-						vg   > -33 && vg   < 32 &&
-						vg_b >  -9 && vg_b <  8
-					) {
-						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
-						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
-					}
-					else {
-						bytes[p++] = QOI_OP_RGB;
-						bytes[p++] = px.rgba.r;
-						bytes[p++] = px.rgba.g;
-						bytes[p++] = px.rgba.b;
-					}
+				if (index[index_pos].v == px.v) {
+					*op++ = QOI_OP_INDEX | index_pos;
 				}
 				else {
-					bytes[p++] = QOI_OP_RGBA;
-					bytes[p++] = px.rgba.r;
-					bytes[p++] = px.rgba.g;
-					bytes[p++] = px.rgba.b;
-					bytes[p++] = px.rgba.a;
+					index[index_pos] = px;
+
+					if (px.rgba.a == px_prev.rgba.a) {
+						int s_r = (int)px.rgba.r - (int)px_prev.rgba.r;
+						int s_g = (int)px.rgba.g - (int)px_prev.rgba.g;
+						int s_b = (int)px.rgba.b - (int)px_prev.rgba.b;
+
+						unsigned int d_r = (unsigned int)(s_r + 2) & 0xff;
+						unsigned int d_g = (unsigned int)(s_g + 2) & 0xff;
+						unsigned int d_b = (unsigned int)(s_b + 2) & 0xff;
+
+						if ((d_r | d_g | d_b) <= 3) {
+							*op++ = QOI_OP_DIFF | (d_r << 4) | (d_g << 2) | d_b;
+						}
+						else {
+							unsigned int u_vg  = (unsigned int)(s_g + 32) & 0xff;
+							unsigned int u_vgr = (unsigned int)(s_r - s_g + 8) & 0xff;
+							unsigned int u_vgb = (unsigned int)(s_b - s_g + 8) & 0xff;
+
+							if (u_vg <= 63 && (u_vgr | u_vgb) <= 15) {
+								*op++ = QOI_OP_LUMA | u_vg;
+								*op++ = (u_vgr << 4) | u_vgb;
+							}
+							else {
+								*op++ = QOI_OP_RGB;
+								*op++ = px.rgba.r;
+								*op++ = px.rgba.g;
+								*op++ = px.rgba.b;
+							}
+						}
+					}
+					else {
+						*op++ = QOI_OP_RGBA;
+						*op++ = px.rgba.r;
+						*op++ = px.rgba.g;
+						*op++ = px.rgba.b;
+						*op++ = px.rgba.a;
+					}
 				}
 			}
+			px_prev = px;
 		}
-		px_prev = px;
+	}
+	else {
+		for (px_pos = 0; px_pos < px_len; px_pos += 3) {
+			if (px_pos != px_end) {
+				memcpy(&px, pixels + px_pos, 4);
+				px.rgba.a = 255;
+			}
+			else {
+				px.rgba.r = pixels[px_pos + 0];
+				px.rgba.g = pixels[px_pos + 1];
+				px.rgba.b = pixels[px_pos + 2];
+				/* alpha is already 255 */
+			}
+
+			if (px.v == px_prev.v) {
+				run++;
+				if (run == 62 || px_pos == px_end) {
+					*op++ = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
+			}
+			else {
+				int index_pos;
+
+				if (run > 0) {
+					*op++ = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
+
+				index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+
+				if (index[index_pos].v == px.v) {
+					*op++ = QOI_OP_INDEX | index_pos;
+				}
+				else {
+					/* alpha is constant in this loop, so the RGBA arm and the
+					   alpha compare of the reference encoder are unreachable */
+					int s_r = (int)px.rgba.r - (int)px_prev.rgba.r;
+					int s_g = (int)px.rgba.g - (int)px_prev.rgba.g;
+					int s_b = (int)px.rgba.b - (int)px_prev.rgba.b;
+
+					unsigned int d_r = (unsigned int)(s_r + 2) & 0xff;
+					unsigned int d_g = (unsigned int)(s_g + 2) & 0xff;
+					unsigned int d_b = (unsigned int)(s_b + 2) & 0xff;
+
+					index[index_pos] = px;
+
+					if ((d_r | d_g | d_b) <= 3) {
+						*op++ = QOI_OP_DIFF | (d_r << 4) | (d_g << 2) | d_b;
+					}
+					else {
+						unsigned int u_vg  = (unsigned int)(s_g + 32) & 0xff;
+						unsigned int u_vgr = (unsigned int)(s_r - s_g + 8) & 0xff;
+						unsigned int u_vgb = (unsigned int)(s_b - s_g + 8) & 0xff;
+
+						if (u_vg <= 63 && (u_vgr | u_vgb) <= 15) {
+							*op++ = QOI_OP_LUMA | u_vg;
+							*op++ = (u_vgr << 4) | u_vgb;
+						}
+						else {
+							*op++ = QOI_OP_RGB;
+							*op++ = px.rgba.r;
+							*op++ = px.rgba.g;
+							*op++ = px.rgba.b;
+						}
+					}
+				}
+			}
+			px_prev = px;
+		}
 	}
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
-		bytes[p++] = qoi_padding[i];
+		*op++ = qoi_padding[i];
 	}
 
-	*out_len = p;
+	*out_len = (int)(op - bytes);
 	return bytes;
 }
 
@@ -525,7 +599,10 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	px_len = desc->width * desc->height * channels;
-	pixels = (unsigned char *) QOI_MALLOC(px_len);
+	/* one byte of slack so every pixel (RGB or RGBA) can be written with a
+	   single 4-byte copy; for 3-channel output the 4th byte is overwritten by
+	   the next pixel and the final one lands in the slack byte */
+	pixels = (unsigned char *) QOI_MALLOC(px_len + 1);
 	if (!pixels) {
 		return NULL;
 	}
@@ -537,52 +614,61 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	px.rgba.a = 255;
 
 	chunks_len = size - (int)sizeof(qoi_padding);
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		if (run > 0) {
-			run--;
-		}
-		else if (p < chunks_len) {
+	for (px_pos = 0; px_pos < px_len; ) {
+		if (p < chunks_len) {
 			int b1 = bytes[p++];
 
-			if (b1 == QOI_OP_RGB) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-			}
-			else if (b1 == QOI_OP_RGBA) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				px.rgba.a = bytes[p++];
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
-				px = index[b1];
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
-				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-				px.rgba.b += ( b1       & 0x03) - 2;
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+			/* 4-way dispatch on the 2-bit tag, ordered so the most frequent
+			   chunk (QOI_OP_LUMA, typically >50% of photographic streams) is
+			   tested first. RGB/RGBA share the RUN tag bits, so that arm
+			   distinguishes them before assuming RUN. The palette store after
+			   every chunk is kept exactly as the reference decoder does it,
+			   so any valid stream decodes identically. */
+			switch (b1 >> 6) {
+			case 2: { /* QOI_OP_LUMA */
 				int b2 = bytes[p++];
 				int vg = (b1 & 0x3f) - 32;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
+				break;
 			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
-				run = (b1 & 0x3f);
+			case 0: /* QOI_OP_INDEX */
+				px = index[b1];
+				break;
+			case 1: /* QOI_OP_DIFF */
+				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
+				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
+				px.rgba.b += ( b1       & 0x03) - 2;
+				break;
+			default: /* QOI_OP_RUN / QOI_OP_RGB / QOI_OP_RGBA */
+				if (b1 == QOI_OP_RGB) {
+					px.rgba.r = bytes[p++];
+					px.rgba.g = bytes[p++];
+					px.rgba.b = bytes[p++];
+				}
+				else if (b1 == QOI_OP_RGBA) {
+					px.rgba.r = bytes[p++];
+					px.rgba.g = bytes[p++];
+					px.rgba.b = bytes[p++];
+					px.rgba.a = bytes[p++];
+				}
+				else {
+					run = (b1 & 0x3f);
+				}
+				break;
 			}
 
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
-		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
-		
-		if (channels == 4) {
-			pixels[px_pos + 3] = px.rgba.a;
+		memcpy(pixels + px_pos, &px, 4);
+		px_pos += channels;
+
+		/* burst-write the rest of a run without re-entering the dispatch */
+		for (; run > 0 && px_pos < px_len; run--) {
+			memcpy(pixels + px_pos, &px, 4);
+			px_pos += channels;
 		}
 	}
 
